@@ -25,6 +25,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <stdint.h>
+#include <unistd.h>
 #include <exception>
 #include "libtorch_utils.h"
 #include "triton/backend/backend_common.h"
@@ -531,6 +532,9 @@ class ModelInstanceState : public BackendModelInstance {
       NamingConvention* naming_convention,
       const std::vector<std::string>& allowed_io);
 
+  // Transfer model instance from CPU to GPU
+  TRITONSERVER_Error* InitGPU();
+
   ModelState* model_state_;
 
   // The full path to the TorchScript model file.
@@ -582,11 +586,28 @@ ModelInstanceState::ModelInstanceState(
     : BackendModelInstance(model_state, triton_model_instance),
       model_state_(model_state), device_(torch::kCPU), is_dict_input_(false)
 {
+  LOG_MESSAGE(
+      TRITONSERVER_LOG_INFO,
+      (std::string("Torch backend is loading ") ).c_str());
+
+  THROW_IF_BACKEND_INSTANCE_ERROR(model_state->LoadModel(
+      ArtifactFilename(), device_, &model_path_, &torch_model_));
+  
+  LOG_MESSAGE(
+      TRITONSERVER_LOG_INFO,
+      (std::string("Torch backend loaded model from ") + model_path_).c_str());
+
   if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
 #ifdef TRITON_ENABLE_GPU
     device_ = torch::Device(torch::kCUDA, DeviceId());
-    // Need to set the CUDA context so that the context that events are
-    // created on match with contexts that events are recorded with.
+    // log and sleep
+    LOG_MESSAGE(TRITONSERVER_LOG_INFO, (std::string("Ready to C/R")).c_str());
+    while (true) {
+      time_t now = time(0);
+      char* dt = ctime(&now);
+      LOG_MESSAGE(TRITONSERVER_LOG_INFO, (dt));
+      sleep(1);
+    }
     THROW_IF_BACKEND_INSTANCE_ERROR(ConvertCUDAStatusToTritonError(
         cudaSetDevice(DeviceId()), TRITONSERVER_ERROR_INTERNAL,
         "Failed to set the device"));
@@ -599,11 +620,9 @@ ModelInstanceState::ModelInstanceState(
     THROW_IF_BACKEND_INSTANCE_ERROR(ConvertCUDAStatusToTritonError(
         cudaEventCreate(&compute_output_start_event_),
         TRITONSERVER_ERROR_INTERNAL, "Failed to create cuda event"));
+    InitGPU();
 #endif
   }
-
-  THROW_IF_BACKEND_INSTANCE_ERROR(model_state->LoadModel(
-      ArtifactFilename(), device_, &model_path_, &torch_model_));
 
   size_t expected_input_cnt = 0;
   {
@@ -1479,6 +1498,46 @@ ModelInstanceState::GetNamingConvention(
         }
       }
     }
+  }
+
+  return nullptr;  // success
+}
+
+TRITONSERVER_Error*
+ModelInstanceState::InitGPU()
+{
+  common::TritonJson::Value& model_config = backend_model_->ModelConfig();
+
+  cudaDeviceProp cuprops;
+  cudaError_t cuerr = cudaGetDeviceProperties(&cuprops, device_id_);
+  if (cuerr != cudaSuccess) {
+    throw BackendModelInstanceException(TRITONSERVER_ErrorNew(
+        TRITONSERVER_ERROR_INTERNAL,
+        (std::string("unable to get CUDA device properties for ") + name_ +
+         ": " + cudaGetErrorString(cuerr))
+            .c_str()));
+  }
+
+  const std::string cc =
+      std::to_string(cuprops.major) + "." + std::to_string(cuprops.minor);
+  common::TritonJson::Value cc_names;
+  common::TritonJson::Value cc_name;
+  if ((model_config.Find("cc_model_filenames", &cc_names)) &&
+      (cc_names.Find(cc.c_str(), &cc_name))) {
+    cc_name.AsString(&artifact_filename_);
+  }
+
+  LOG_MESSAGE(TRITONSERVER_LOG_VERBOSE,
+              (std::string("Creating instance ") + name_ + " on GPU " +
+               std::to_string(device_id_) + " (" + cc + ") using artifact '" +
+               artifact_filename_ + "'")
+                  .c_str());
+
+  // Create the CUDA stream that will be used to execute all models
+  // on this GPU device.
+  if (stream_ == nullptr) {
+    THROW_IF_BACKEND_INSTANCE_ERROR(
+        CreateCudaStream(device_id_, 0 /* cuda_stream_priority */, &stream_));
   }
 
   return nullptr;  // success
