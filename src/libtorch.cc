@@ -26,6 +26,7 @@
 
 #include <stdint.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <exception>
 #include "libtorch_utils.h"
 #include "triton/backend/backend_common.h"
@@ -463,6 +464,13 @@ ModelState::ParseParameters()
   return nullptr;
 }
 
+const char* DEPLOYED_FILENAME = "/opt/tritonserver/DEPLOYED";
+
+inline bool deployed(const char* deployed_file) {
+  struct stat buffer;
+  return (stat(deployed_file, &buffer) == 0);
+}
+
 // The naming convention followed for inputs/outputs in the model configuration.
 // Outputs don't support FORWARD_ARGUMENT.
 enum class NamingConvention {
@@ -602,12 +610,13 @@ ModelInstanceState::ModelInstanceState(
     device_ = torch::Device(torch::kCUDA, DeviceId());
     // log and sleep
     LOG_MESSAGE(TRITONSERVER_LOG_INFO, (std::string("Ready to C/R")).c_str());
-    while (true) {
-      time_t now = time(0);
-      char* dt = ctime(&now);
-      LOG_MESSAGE(TRITONSERVER_LOG_INFO, (dt));
-      sleep(1);
+    while (!deployed(DEPLOYED_FILENAME)) {
+      // LOG_MESSAGE(TRITONSERVER_LOG_INFO,
+      //             (std::string("Waiting for deployment")).c_str());
+      // sleep(1);
     }
+    LOG_MESSAGE(TRITONSERVER_LOG_INFO, (std::string("Deployed")).c_str());
+
     THROW_IF_BACKEND_INSTANCE_ERROR(ConvertCUDAStatusToTritonError(
         cudaSetDevice(DeviceId()), TRITONSERVER_ERROR_INTERNAL,
         "Failed to set the device"));
@@ -620,7 +629,9 @@ ModelInstanceState::ModelInstanceState(
     THROW_IF_BACKEND_INSTANCE_ERROR(ConvertCUDAStatusToTritonError(
         cudaEventCreate(&compute_output_start_event_),
         TRITONSERVER_ERROR_INTERNAL, "Failed to create cuda event"));
+
     InitGPU();
+    torch_model_->to(device_);
 #endif
   }
 
