@@ -254,7 +254,7 @@ ModelState::LoadModel(
   try {
     std::istringstream model_stream(model_data_str);
     torch_model->reset(
-        new torch::jit::Module(torch::jit::load(model_stream, device)));
+        new torch::jit::Module(torch::jit::load(model_stream)));
   }
   catch (const std::exception& ex) {
     return TRITONSERVER_ErrorNew(
