@@ -1339,63 +1339,43 @@ ModelInstanceState::Execute(
       model_outputs_ = torch_model_->forward(*input_tensors);
     }
 
-    const std::string& model_name = Name();
-    // if model name contains "opt" or "bert", process output
-    if (model_name.find("opt") != std::string::npos) {
+    if (model_outputs_.isTuple()) {
       auto model_outputs_tuple = model_outputs_.toTuple();
-      auto model_output_tensor = model_outputs_tuple->elements()[0].toTensor().index(
-          {0, torch::indexing::Slice(), 0});
-      // convert fp16 to fp32
-      if (model_output_tensor.scalar_type() == torch::kHalf) {
-        model_output_tensor = model_output_tensor.to(torch::kFloat);
-      }
-      // reshape output to [1, -1]
-      model_output_tensor = model_output_tensor.reshape({1, -1});
-      output_tensors->push_back(model_output_tensor);
-    } else if (model_name.find("bert") != std::string::npos) {
-      // for bert models, only return the second output
-      auto model_outputs_tuple = model_outputs_.toTuple();
-      auto model_output_tensor = model_outputs_tuple->elements()[1];
-      output_tensors->push_back(model_output_tensor);
-    } else {
-      if (model_outputs_.isTuple()) {
-        auto model_outputs_tuple = model_outputs_.toTuple();
-        size_t op_index = 0;
-        for (auto& m_op : model_outputs_tuple->elements()) {
-          if (m_op.isList()) {
-            auto list_output = m_op.toList();
-            if (list_output.elementType()->kind() !=
-                c10::TypeKind::StringType) {
-              throw std::invalid_argument(
-                  "output at index " + std::to_string(op_index) +
-                  " must be of type Tensor or List[str], received List[" +
-                  list_output.elementType()->str() + "]");
-            }
-            output_tensors->push_back(m_op);
-          } else {
-            auto tensor_output = m_op.toTensor();
-            output_tensors->push_back(m_op);
+      size_t op_index = 0;
+      for (auto& m_op : model_outputs_tuple->elements()) {
+        if (m_op.isList()) {
+          auto list_output = m_op.toList();
+          if (list_output.elementType()->kind() !=
+              c10::TypeKind::StringType) {
+            throw std::invalid_argument(
+                "output at index " + std::to_string(op_index) +
+                " must be of type Tensor or List[str], received List[" +
+                list_output.elementType()->str() + "]");
           }
-          op_index++;
+          output_tensors->push_back(m_op);
+        } else {
+          auto tensor_output = m_op.toTensor();
+          output_tensors->push_back(m_op);
         }
-      } else if (model_outputs_.isTensor()) {
-        output_tensors->push_back(model_outputs_);
-      } else if (model_outputs_.isList()) {
-        auto list_output = model_outputs_.toList();
-        if (list_output.elementType()->kind() != c10::TypeKind::StringType) {
-          throw std::invalid_argument(
-              "output must be of type Tensor or List[str], received List[" +
-              list_output.elementType()->str() + "]");
-        }
-        output_tensors->push_back(model_outputs_);
-      } else {
-        throw std::invalid_argument(
-            "output must be of type Tensor, List[str] or Tuple containing one "
-            "of "
-            "these two types. It should not be a List / Dictionary of Tensors "
-            "or "
-            "a Scalar");
+        op_index++;
       }
+    } else if (model_outputs_.isTensor()) {
+      output_tensors->push_back(model_outputs_);
+    } else if (model_outputs_.isList()) {
+      auto list_output = model_outputs_.toList();
+      if (list_output.elementType()->kind() != c10::TypeKind::StringType) {
+        throw std::invalid_argument(
+            "output must be of type Tensor or List[str], received List[" +
+            list_output.elementType()->str() + "]");
+      }
+      output_tensors->push_back(model_outputs_);
+    } else {
+      throw std::invalid_argument(
+          "output must be of type Tensor, List[str] or Tuple containing one "
+          "of "
+          "these two types. It should not be a List / Dictionary of Tensors "
+          "or "
+          "a Scalar");
     }
   }
   catch (std::exception& ex) {
