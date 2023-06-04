@@ -52,10 +52,11 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime_api.h>
-#include <nvml.h>
 #endif  // TRITON_ENABLE_GPU
 
 #include <grpcpp/grpcpp.h>
+
+#include "phantom_checkpoint.h"
 
 #include "storage.grpc.pb.h"
 
@@ -231,7 +232,7 @@ ModelState::ModelState(TRITONBACKEND_Model* triton_model)
   }
 
   // Connect to Phantom scheduler
-  char* server_addr = getenv("PHANTOM_SCHEDULER_ADDR");
+  char* server_addr = getenv("PHANTOM_SCHEDULER_ADDRESS");
   if (server_addr == nullptr) {
     LOG_MESSAGE(
         TRITONSERVER_LOG_ERROR,
@@ -241,51 +242,6 @@ ModelState::ModelState(TRITONBACKEND_Model* triton_model)
     auto channel =
         grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
     stub_ = storage::Storage::NewStub(channel);
-  }
-
-  // Get GPU info
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  // get all devices
-  nvmlReturn_t result;
-  result = nvmlInit();
-  if (NVML_SUCCESS != result) {
-    LOG_MESSAGE(
-        TRITONSERVER_LOG_ERROR,
-        (std::string("Failed to initialize NVML: ") +
-         nvmlErrorString(result))
-            .c_str());
-  }
-  for (int i = 0; i < device_count; i++) {
-    nvmlDevice_t device;
-    result = nvmlDeviceGetHandleByIndex(i, &device);
-    if (NVML_SUCCESS != result) {
-      LOG_MESSAGE(
-          TRITONSERVER_LOG_ERROR,
-          (std::string("Failed to get handle for device ") + std::to_string(i) +
-           ": " + nvmlErrorString(result))
-              .c_str());
-    }
-    char uuid[NVML_DEVICE_UUID_BUFFER_SIZE];
-    result = nvmlDeviceGetUUID(device, uuid, NVML_DEVICE_UUID_BUFFER_SIZE);
-    if (NVML_SUCCESS != result) {
-      LOG_MESSAGE(
-          TRITONSERVER_LOG_ERROR,
-          (std::string("Failed to get uuid for device ") + std::to_string(i) +
-           ": " + nvmlErrorString(result))
-              .c_str());
-    }
-    LOG_MESSAGE(
-        TRITONSERVER_LOG_VERBOSE,
-        (std::string("GPU ") + std::to_string(i) + " uuid: " + uuid).c_str());
-    gpu_uuid_map_[std::string(uuid)] = i;
-  }
-  result = nvmlShutdown();
-  if (NVML_SUCCESS != result) {
-    LOG_MESSAGE(
-        TRITONSERVER_LOG_ERROR,
-        (std::string("Failed to shutdown NVML: ") + nvmlErrorString(result))
-            .c_str());
   }
 }
 
@@ -301,6 +257,17 @@ ModelState::LoadModel(
 
   std::string model_name = Name();
   std::string converted_model_path = RepositoryPath() + "/";
+
+  torch::jit::script::Module converted_module;
+  try {
+    converted_module = torch::jit::load(converted_model_path);
+  }
+  catch (const std::exception& ex) {
+    return TRITONSERVER_ErrorNew(
+        TRITONSERVER_ERROR_INTERNAL,
+        ("failed to load model '" + Name() + "': " + ex.what()).c_str());
+  }
+
   std::unordered_map<std::string, void*> tensor_pool;
   {
     // load model
@@ -323,63 +290,39 @@ ModelState::LoadModel(
         (std::string("Received ") + std::to_string(handles.size()) +
          " handles for model " + model_name)
             .c_str());
+
+    // convert handles to unordered_map
+    std::unordered_map<std::string, std::string> tensor_handles;
     for (auto& handle_pair : handles) {
-      const auto& dev_uuid = handle_pair.first;
-      const auto& handle = handle_pair.second;
-      if (dev_uuid.empty() || gpu_uuid_map_.find(dev_uuid) == gpu_uuid_map_.end()) {
-        LOG_MESSAGE(
-            TRITONSERVER_LOG_ERROR,
-            (std::string("Skip loading model ") + model_name + " to GPU " +
-             dev_uuid)
-                .c_str());
-        continue;
-      }
-      int dev_id = gpu_uuid_map_.at(dev_uuid);
-      cudaSetDevice(dev_id);
-      cudaIpcMemHandle_t* cuda_handle = (cudaIpcMemHandle_t*)handle.data();
-      void* tensor_ptr = nullptr;
-      cudaIpcOpenMemHandle(&tensor_ptr, *cuda_handle,
-                           cudaIpcMemLazyEnablePeerAccess);
-      if (tensor_ptr == nullptr) {
-        LOG_MESSAGE(
-            TRITONSERVER_LOG_ERROR,
-            (std::string("Failed to open handle for model ") + model_name +
-             " to GPU " + dev_uuid)
-                .c_str());
-        continue;
-      }
-      tensor_pool["cuda:" + std::to_string(dev_id)] = tensor_ptr;
-      LOG_MESSAGE(
-          TRITONSERVER_LOG_VERBOSE,
-          (std::string("Loaded model ") + model_name + " to GPU " +
-           std::to_string(dev_id))
-              .c_str());
+      tensor_handles[handle_pair.first] = handle_pair.second;
     }
-  }
-  try {
-    torch_model->reset(
-        new torch::jit::Module(torch::jit::fastLoad(converted_model_path, tensor_pool)));
-  }
-  catch (const std::exception& ex) {
-    return TRITONSERVER_ErrorNew(
-        TRITONSERVER_ERROR_INTERNAL,
-        ("failed to load model '" + Name() + "': " + ex.what()).c_str());
+
+    // set storage
+    SetStorage(converted_module, converted_model_path, tensor_handles);
   }
 
   {
+    // confirm model is loaded in GPU
     storage::ConfirmModelRequest request;
     storage::ConfirmModelResponse response;
     grpc::ClientContext context;
     request.set_model_name(model_name);
     grpc::Status status = stub_->ConfirmModelInGpu(&context, request, &response);
     if (!status.ok()) {
-      // std::cout << "ConfirmModel failed: " << status.error_message()
-      //           << std::endl;
       return TRITONSERVER_ErrorNew(
           TRITONSERVER_ERROR_INTERNAL,
           ("failed to load model '" + Name() + "': " + status.error_message())
               .c_str());
     }
+  }
+
+  // reset model
+  try {
+    torch_model->reset(&converted_module);
+  } catch (const std::exception& e) {
+    return TRITONSERVER_ErrorNew(
+        TRITONSERVER_ERROR_INTERNAL,
+        ("failed to reset model '" + Name() + "': " + e.what()).c_str());
   }
 
   return nullptr;  // success
