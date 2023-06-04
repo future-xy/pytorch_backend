@@ -25,6 +25,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <exception>
 #include "libtorch_utils.h"
 #include "triton/backend/backend_common.h"
@@ -53,6 +54,12 @@
 #include <cuda_runtime_api.h>
 #endif  // TRITON_ENABLE_GPU
 
+#include <grpcpp/grpcpp.h>
+
+#include "phantom_checkpoint.h"
+
+#include "storage.grpc.pb.h"
+
 //
 // PyTorch C++ (LibTorch) Backend that implements the TRITONBACKEND API.
 //
@@ -70,7 +77,26 @@ class ModelState : public BackendModel {
  public:
   static TRITONSERVER_Error* Create(
       TRITONBACKEND_Model* triton_model, ModelState** state);
-  virtual ~ModelState() = default;
+  virtual ~ModelState() {
+    // call grpc server to delete the model
+    std::string model_name = Name();
+    {
+      // load model
+      std::cout << "Loading model: " << model_name << std::endl;
+      storage::UnloadModelRequest request;
+      request.set_model_name(model_name);
+      storage::UnloadModelResponse response;
+      grpc::ClientContext context;
+      grpc::Status status =
+          stub_->UnloadModelFromGpu(&context, request, &response);
+      if (!status.ok()) {
+        LOG_MESSAGE(
+            TRITONSERVER_LOG_ERROR,
+            (std::string("UnloadModelFromGpu rpc failed: ") + status.error_message())
+                .c_str());
+      }
+    }
+  }
 
   // Load a TorchScript model using 'artifact_name' as the name for the
   // TorchScript file. Return in 'model_path' the full path to the
@@ -145,6 +171,12 @@ class ModelState : public BackendModel {
   // List of all the outputs specified in the output section of model
   // configuration.
   std::vector<std::string> output_names_;
+
+  // grpc client
+  std::unique_ptr<storage::Storage::Stub> stub_;
+
+  // gpu map
+  std::map<std::string, int> gpu_uuid_map_;
 };
 
 TRITONSERVER_Error*
@@ -198,6 +230,19 @@ ModelState::ModelState(TRITONBACKEND_Model* triton_model)
         io.MemberAsString("name", &io_name, &io_name_len));
     output_names_.emplace_back(io_name);
   }
+
+  // Connect to Phantom scheduler
+  char* server_addr = getenv("PHANTOM_SCHEDULER_ADDRESS");
+  if (server_addr == nullptr) {
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_ERROR,
+        (std::string("PHANTOM_SCHEDULER_ADDR is not set.")).c_str());
+  } else {
+    std::string server_address(server_addr);
+    auto channel =
+        grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
+    stub_ = storage::Storage::NewStub(channel);
+  }
 }
 
 TRITONSERVER_Error*
@@ -206,69 +251,75 @@ ModelState::LoadModel(
     std::string* model_path,
     std::shared_ptr<torch::jit::script::Module>* torch_model)
 {
-  // Find the TorchScript file that describes the model. If the model
-  // configuration doesn't have an explicit model file specified then
-  // use the default name ("model.pt").
-  std::string cc_model_filename = artifact_name;
-  if (cc_model_filename.empty()) {
-    cc_model_filename = "model.pt";
-  }
-
-  *model_path = JoinPath(
-      {RepositoryPath(), std::to_string(Version()), cc_model_filename});
-
-  {
-    bool exists;
-    RETURN_IF_ERROR(FileExists(*model_path, &exists));
-    RETURN_ERROR_IF_FALSE(
-        exists, TRITONSERVER_ERROR_UNAVAILABLE,
-        std::string("unable to find '") + *model_path +
-            "' for model instance '" + Name() + "'");
-  }
-
-  // If weight sharing is enabled, skip loading model if
-  // it is already available on the target device
-  std::pair<bool, int> device_pair;
-  if (enable_weight_sharing_) {
-    device_pair = std::make_pair(!device.is_cpu(), device.index());
-    auto mit = torch_models_.find(device_pair);
-    if (mit != torch_models_.end()) {
-      *torch_model = mit->second;
-      LOG_MESSAGE(
-          TRITONSERVER_LOG_INFO,
-          (std::string("Reusing TorchScript model for instance '") + Name() +
-           "'")
-              .c_str());
-      return nullptr;  // success
-    }
-  }
-
-  // Serialize the torch model to string
-  std::string model_data_str;
-  RETURN_IF_ERROR(ReadTextFile(*model_path, &model_data_str));
-
   // InferenceMode should be used to guard all tensors operations including
   // model loading: https://pytorch.org/cppdocs/notes/inference_mode.html
   torch::InferenceMode infer_guard(EnabledInferenceMode());
 
+  std::string model_name = Name();
+  std::string converted_model_path = RepositoryPath();
+
+  // log model name and path
+  LOG_MESSAGE(
+      TRITONSERVER_LOG_INFO,
+      (std::string("Loading model: ") + model_name + " from " +
+       converted_model_path)
+          .c_str());
+
   try {
-    std::istringstream model_stream(model_data_str);
-    torch_model->reset(
-        new torch::jit::Module(torch::jit::load(model_stream, device)));
-  }
-  catch (const std::exception& ex) {
+    torch_model->reset(new torch::jit::Module(torch::jit::load(converted_model_path + "/model.pt")));
+  } catch (const std::exception& e) {
     return TRITONSERVER_ErrorNew(
         TRITONSERVER_ERROR_INTERNAL,
-        ("failed to load model '" + Name() + "': " + ex.what()).c_str());
+        ("failed to reset model '" + Name() + "': " + e.what()).c_str());
   }
 
-  if (enable_weight_sharing_) {
-    if (!((torch_models_.emplace(device_pair, *torch_model)).second)) {
-      std::string type = device.is_cpu() ? "CPU" : "GPU";
-      LOG_MESSAGE(
-          TRITONSERVER_LOG_WARN,
-          (std::string("Model already found on target ") + type + " device " +
-           "(id " + std::to_string(device.index()) + ") for '" + Name() + "'")
+  std::unordered_map<std::string, void*> tensor_pool;
+  {
+    // load model
+    std::cout << "Loading model: " << model_name << std::endl;
+    storage::LoadModelRequest request;
+    request.set_model_name(model_name);
+    storage::LoadModelResponse response;
+    grpc::ClientContext context;
+    grpc::Status status = stub_->LoadModelIntoGpu(&context, request, &response);
+    if (!status.ok()) {
+      return TRITONSERVER_ErrorNew(
+          TRITONSERVER_ERROR_INTERNAL,
+          ("failed to load model '" + Name() + "': " + status.error_message())
+              .c_str());
+    }
+
+    const auto& handles = response.handles();
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_VERBOSE,
+        (std::string("Received ") + std::to_string(handles.size()) +
+         " handles for model " + model_name)
+            .c_str());
+
+    // convert handles to unordered_map
+    std::unordered_map<std::string, std::string> tensor_handles;
+    for (auto& handle_pair : handles) {
+      tensor_handles[handle_pair.first] = handle_pair.second;
+    }
+
+    // set storage
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_VERBOSE,
+        (std::string("Setting storage for model ") + model_name).c_str());
+    SetStorage(**torch_model, converted_model_path, tensor_handles);
+  }
+
+  {
+    // confirm model is loaded in GPU
+    storage::ConfirmModelRequest request;
+    storage::ConfirmModelResponse response;
+    grpc::ClientContext context;
+    request.set_model_name(model_name);
+    grpc::Status status = stub_->ConfirmModelInGpu(&context, request, &response);
+    if (!status.ok()) {
+      return TRITONSERVER_ErrorNew(
+          TRITONSERVER_ERROR_INTERNAL,
+          ("failed to load model '" + Name() + "': " + status.error_message())
               .c_str());
     }
   }
@@ -1374,8 +1425,7 @@ ModelInstanceState::Execute(
           "these two types. It should not be a List / Dictionary of Tensors or "
           "a Scalar");
     }
-  }
-  catch (std::exception& ex) {
+  } catch (std::exception& ex) {
     SendErrorForResponses(
         responses, response_count,
         TRITONSERVER_ErrorNew(

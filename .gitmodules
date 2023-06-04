@@ -1,0 +1,3 @@
+[submodule "Phantom-component"]
+	path = Phantom-component
+	url = https://github.com/future-xy/Phantom-component.git

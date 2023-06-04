@@ -91,6 +91,11 @@ find_package(Python3 REQUIRED COMPONENTS Development)
 include(FetchContent)
 
 FetchContent_Declare(
+  grpc
+  GIT_REPOSITORY https://github.com/grpc/grpc.git
+  GIT_TAG        v1.33.2
+)
+FetchContent_Declare(
   repo-common
   GIT_REPOSITORY https://github.com/triton-inference-server/common.git
   GIT_TAG ${TRITON_COMMON_REPO_TAG}
@@ -108,7 +113,49 @@ FetchContent_Declare(
   GIT_TAG ${TRITON_BACKEND_REPO_TAG}
   GIT_SHALLOW ON
 )
-FetchContent_MakeAvailable(repo-common repo-core repo-backend)
+FetchContent_MakeAvailable(repo-common repo-core repo-backend grpc)
+
+#
+# gRPC
+#
+set(_PROTOBUF_LIBPROTOBUF protobuf::libprotobuf)
+set(_REFLECTION grpc++_reflection)
+set(_GRPC_GRPCPP grpc++)
+set(_PROTOBUF_PROTOC $<TARGET_FILE:protobuf::protoc>)
+set(_GRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:grpc_cpp_plugin>)
+
+get_filename_component(storage_proto "proto/storage.proto" ABSOLUTE)
+get_filename_component(storage_proto_path "${storage_proto}" PATH)
+# Generated sources
+set(storage_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}/storage.pb.cc")
+set(storage_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}/storage.pb.h")
+set(storage_grpc_srcs "${CMAKE_CURRENT_BINARY_DIR}/storage.grpc.pb.cc")
+set(storage_grpc_hdrs "${CMAKE_CURRENT_BINARY_DIR}/storage.grpc.pb.h")
+add_custom_command(
+  OUTPUT "${storage_proto_srcs}" "${storage_proto_hdrs}" "${storage_grpc_srcs}" "${storage_grpc_hdrs}"
+  COMMAND ${_PROTOBUF_PROTOC}
+  ARGS --grpc_out "${CMAKE_CURRENT_BINARY_DIR}"
+    --cpp_out "${CMAKE_CURRENT_BINARY_DIR}"
+    -I "${storage_proto_path}"
+    --plugin=protoc-gen-grpc="${_GRPC_CPP_PLUGIN_EXECUTABLE}"
+    "${storage_proto}"
+  DEPENDS "${storage_proto}")
+
+# Include generated *.pb.h files
+include_directories("${CMAKE_CURRENT_BINARY_DIR}")
+
+add_library(storage_proto
+  ${storage_proto_srcs}
+  ${storage_grpc_srcs}
+  ${storage_proto_hdrs}
+  ${storage_grpc_hdrs}
+)
+target_link_libraries(storage_proto
+  PUBLIC
+    ${_REFLECTION}
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOBUF}
+)
 
 #
 # CUDA
@@ -372,6 +419,7 @@ endif() # TRITON_PYTORCH_DOCKER_BUILD
 target_link_libraries(
   triton-pytorch-backend
   PRIVATE
+    storage_proto
     triton-core-serverapi  # from repo-core
     triton-core-backendapi # from repo-core
     triton-core-serverstub # from repo-core
@@ -380,11 +428,21 @@ target_link_libraries(
     ${TRITON_PYTORCH_LIBS}
 )
 
+# add phantom
+set(PARENT_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
+add_subdirectory(Phantom-component/phantom_checkpoint)
+
 if(${TRITON_ENABLE_GPU})
   target_link_libraries(
     triton-pytorch-backend
     PRIVATE
       CUDA::cudart
+      phantom_checkpoint
+  )
+  target_include_directories(
+    triton-pytorch-backend
+    PRIVATE
+      Phantom-component/phantom_checkpoint/
   )
 endif() # TRITON_ENABLE_GPU
 
