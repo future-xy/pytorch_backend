@@ -1269,6 +1269,16 @@ ModelInstanceState::ProcessRequests(
   }
 }
 
+void process_opt_output(
+    torch::jit::IValue& model_outputs_) {
+  auto model_outputs_tuple = model_outputs_.toTuple();
+  // get output[0][:,-1,:].argmax(dim=-1)
+  auto model_output_tensor = model_outputs_tuple->elements()[0].toTensor().index(
+      {torch::indexing::Slice(), -1, torch::indexing::Slice()});
+  model_output_tensor = model_output_tensor.argmax(-1);
+  model_outputs_ = torch::jit::IValue(model_output_tensor);
+}
+
 void
 ModelInstanceState::Execute(
     std::vector<TRITONBACKEND_Response*>* responses,
@@ -1337,6 +1347,11 @@ ModelInstanceState::Execute(
       model_outputs_ = torch_model_->forward(input_dict_ivalue);
     } else {
       model_outputs_ = torch_model_->forward(*input_tensors);
+    }
+
+    // if find opt in model name, then process output
+    if (Name().find("opt") != std::string::npos) {
+      process_opt_output(model_outputs_);
     }
 
     if (model_outputs_.isTuple()) {
